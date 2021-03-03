@@ -71,6 +71,17 @@ type sePolStatus struct {
 	Status sePolStatusType
 }
 
+const (
+	reasonCannotContactSelinuxd event.Reason = "CannotContactSelinuxd"
+	reasonCannotRemovePolicy    event.Reason = "CannotRemoveSelinuxPolicy"
+	reasonCannotUpdatePolicy    event.Reason = "CannotUpdateSelinuxPolicy"
+	reasonCannotInstallPolicy   event.Reason = "CannotSaveSelinuxPolicy"
+	reasonCannotWritePolicyFile event.Reason = "CannotWritePolicyFile"
+	reasonCannotGetPolicyStatus event.Reason = "CannotGetPolicyStatus"
+
+	reasonInstalledPolicy event.Reason = "SavedSelinuxPolicy"
+)
+
 // blank assignment to verify that ReconcileSelinuxPolicy implements `reconcile.Reconciler`.
 var _ reconcile.Reconciler = &ReconcileSP{}
 
@@ -109,6 +120,7 @@ func (r *ReconcileSP) Reconcile(_ context.Context, request reconcile.Request) (r
 		policyCopy.Status.State = spov1alpha1.PolicyStatePending
 		policyCopy.Status.SetConditions(rcommonv1.Creating())
 		if err := r.client.Status().Update(context.TODO(), policyCopy); err != nil {
+			r.record.Event(instance, event.Warning(reasonCannotUpdatePolicy, err))
 			return reconcile.Result{}, errors.Wrap(err, "Updating SelinuxPolicy status to PENDING")
 		}
 		return reconcile.Result{}, nil
@@ -121,6 +133,7 @@ func (r *ReconcileSP) Reconcile(_ context.Context, request reconcile.Request) (r
 		policyCopy.Status.State = spov1alpha1.PolicyStatePending
 		policyCopy.Status.SetConditions(rcommonv1.Unavailable())
 		if err := r.client.Status().Update(context.TODO(), policyCopy); err != nil {
+			r.record.Event(instance, event.Warning(reasonCannotUpdatePolicy, err))
 			return reconcile.Result{}, errors.Wrap(err, "Updating SelinuxPolicy status to PENDING")
 		}
 		return reconcile.Result{}, nil
@@ -147,6 +160,7 @@ func (r *ReconcileSP) Reconcile(_ context.Context, request reconcile.Request) (r
 		policyCopy := instance.DeepCopy()
 		policyCopy.Status.SetConditions(rcommonv1.Deleting())
 		if err := r.client.Status().Update(context.TODO(), policyCopy); err != nil {
+			r.record.Event(instance, event.Warning(reasonCannotUpdatePolicy, err))
 			return reconcile.Result{}, errors.Wrap(err, "Updating SelinuxPolicy status condition to indicate deletion")
 		}
 		return reconcile.Result{}, nil
@@ -155,6 +169,7 @@ func (r *ReconcileSP) Reconcile(_ context.Context, request reconcile.Request) (r
 	if SliceContainsString(instance.ObjectMeta.Finalizers, selinuxFinalizerName) {
 		res, err := r.reconcileDeletePolicy(instance, reqLogger)
 		if res.Requeue || err != nil {
+			r.record.Event(instance, event.Warning(reasonCannotRemovePolicy, err))
 			return res, err
 		}
 
@@ -169,6 +184,7 @@ func (r *ReconcileSP) addFinalizer(sp *spov1alpha1.SelinuxPolicy) (reconcile.Res
 	spcopy := sp.DeepCopy()
 	spcopy.ObjectMeta.Finalizers = append(spcopy.ObjectMeta.Finalizers, selinuxFinalizerName)
 	if err := r.client.Update(context.Background(), spcopy); err != nil {
+		r.record.Event(sp, event.Warning(reasonCannotUpdatePolicy, err))
 		return reconcile.Result{}, errors.Wrap(err, "Adding finalizer to SelinuxPolicy")
 	}
 	return reconcile.Result{}, nil
@@ -178,6 +194,7 @@ func (r *ReconcileSP) addUsageStatus(sp *spov1alpha1.SelinuxPolicy) error {
 	spcopy := sp.DeepCopy()
 	spcopy.Status.Usage = GetPolicyUsage(spcopy.Name, spcopy.Namespace)
 	if err := r.client.Status().Update(context.Background(), spcopy); err != nil {
+		r.record.Event(sp, event.Warning(reasonCannotUpdatePolicy, err))
 		return errors.Wrap(err, "Updating SelinuxPolicy usage status")
 	}
 	return nil
@@ -187,6 +204,7 @@ func (r *ReconcileSP) removeFinalizer(sp *spov1alpha1.SelinuxPolicy) (reconcile.
 	spcopy := sp.DeepCopy()
 	spcopy.ObjectMeta.Finalizers = RemoveStringFromSlice(spcopy.ObjectMeta.Finalizers, selinuxFinalizerName)
 	if err := r.client.Update(context.Background(), spcopy); err != nil {
+		r.record.Event(sp, event.Warning(reasonCannotUpdatePolicy, err))
 		return reconcile.Result{}, errors.Wrap(err, "Removing SelinuxPolicy finalizer")
 	}
 	return reconcile.Result{}, nil
@@ -195,21 +213,25 @@ func (r *ReconcileSP) removeFinalizer(sp *spov1alpha1.SelinuxPolicy) (reconcile.
 func (r *ReconcileSP) reconcilePolicy(sp *spov1alpha1.SelinuxPolicy, l logr.Logger) (reconcile.Result, error) {
 	selinuxdReady, err := isSelinuxdReady()
 	if err != nil {
+		r.record.Event(sp, event.Warning(reasonCannotContactSelinuxd, err))
 		return reconcile.Result{}, errors.Wrap(err, "contacting selinuxd")
 	}
 	if !selinuxdReady {
+		r.record.Event(sp, event.Normal(reasonCannotContactSelinuxd, "selinuxd not yet up, requeue"))
 		l.Info("selinuxd not yet up, requeue")
 		return reconcile.Result{Requeue: true}, nil
 	}
 
 	err = r.reconcilePolicyFile(sp, l)
 	if err != nil {
+		r.record.Event(sp, event.Warning(reasonCannotWritePolicyFile, err))
 		return reconcile.Result{}, errors.Wrap(err, "Creating policy file")
 	}
 
 	l.Info("Checking if policy is installed", "policyName", sp.Name)
 	polStatus, err := getPolicyStatus(sp)
 	if err != nil {
+		r.record.Event(sp, event.Warning(reasonCannotGetPolicyStatus, err))
 		return reconcile.Result{}, errors.Wrap(err, "Looking up policy status")
 	}
 
@@ -219,6 +241,7 @@ func (r *ReconcileSP) reconcilePolicy(sp *spov1alpha1.SelinuxPolicy, l logr.Logg
 		policyCopy.Status.State = spov1alpha1.PolicyStateInProgress
 		policyCopy.Status.SetConditions(rcommonv1.Creating())
 		if err := r.client.Status().Update(context.TODO(), policyCopy); err != nil {
+			r.record.Event(sp, event.Warning(reasonCannotUpdatePolicy, err))
 			return reconcile.Result{}, errors.Wrap(err, "Updating SELinux policy with installation in progress")
 		}
 		return reconcile.Result{Requeue: true}, nil
@@ -231,13 +254,15 @@ func (r *ReconcileSP) reconcilePolicy(sp *spov1alpha1.SelinuxPolicy, l logr.Logg
 	case installedStatus:
 		policyCopy.Status.State = spov1alpha1.PolicyStateInstalled
 		policyCopy.Status.SetConditions(rcommonv1.Available())
+		r.record.Event(sp, event.Normal(reasonInstalledPolicy, "Successfully wrote policy to disk"))
 	case failedStatus:
 		policyCopy.Status.State = spov1alpha1.PolicyStateError
 		policyCopy.Status.SetConditions(rcommonv1.Unavailable())
+		r.record.Event(sp, event.Warning(reasonCannotInstallPolicy, errors.New("Failed to write policy to disk")))
 	}
 
 	if err := r.client.Status().Update(context.TODO(), policyCopy); err != nil {
-		return reconcile.Result{}, errors.Wrap(err, "Updating SELinux policy with installation success")
+		return reconcile.Result{}, errors.Wrap(err, "Updating SELinux policy with installation result")
 	}
 
 	return reconcile.Result{}, nil
